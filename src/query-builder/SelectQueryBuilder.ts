@@ -2017,6 +2017,160 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
     }
 
     /**
+     * Streams entities, hydrated the same way `getMany()` hydrates them, instead
+     * of the raw alias-prefixed driver rows returned by `stream()`.
+     *
+     * Rows are buffered until a chunk can be closed on a root-entity boundary,
+     * then transformed and yielded. Because a root entity is only complete once
+     * every one of its joined rows has arrived, the query must be ordered by the
+     * root primary key; otherwise rows for one entity can be interleaved with
+     * another's and the grouping would be wrong. That ordering is not applied
+     * implicitly — it has to be requested, so the query plan stays the caller's.
+     *
+     * Note that "afterLoad" subscribers are broadcast per chunk rather than once
+     * for the whole result set, which is an intentional difference from
+     * `getMany()`.
+     *
+     * @param options
+     * @param options.chunkSize minimum number of rows to accumulate before a
+     * chunk is closed at the next root-entity boundary. Defaults to 1000.
+     */
+    streamEntities(options?: {
+        chunkSize?: number
+    }): AsyncIterableIterator<Entity> {
+        if (!this.expressionMap.mainAlias)
+            throw new TypeORMError(
+                `Alias is not set. Use "from" method to set an alias.`,
+            )
+
+        const mainAlias = this.expressionMap.mainAlias
+        if (!mainAlias.hasMetadata)
+            throw new TypeORMError(
+                `"streamEntities" can only be used when selecting from an entity. Use "stream" for raw results.`,
+            )
+
+        const metadata = mainAlias.metadata
+        if (metadata.primaryColumns.length === 0)
+            throw new TypeORMError(
+                `"streamEntities" requires ${metadata.name} to have a primary column, because rows are grouped into entities by primary key.`,
+            )
+
+        const primaryKeyAliases = metadata.primaryColumns.map((column) =>
+            DriverUtils.buildAlias(
+                this.dataSource.driver,
+                undefined,
+                mainAlias.name,
+                column.databaseName,
+            ),
+        )
+
+        this.assertOrderedByPrimaryKey(metadata, mainAlias.name)
+
+        const chunkSize = options?.chunkSize ?? 1000
+        if (chunkSize < 1)
+            throw new TypeORMError(`"chunkSize" must be a positive number.`)
+
+        return this.streamEntitiesInternal(primaryKeyAliases, chunkSize)
+    }
+
+    /**
+     * Does the actual streaming and chunked hydration.
+     *
+     * Kept separate from `streamEntities` so that misuse throws when the method
+     * is called rather than on first iteration — the body of an async generator
+     * does not run until something pulls from it, which would otherwise defer
+     * every validation error above.
+     *
+     * @param primaryKeyAliases column aliases of the root primary key
+     * @param chunkSize minimum rows to buffer before closing a chunk
+     */
+    protected async *streamEntitiesInternal(
+        primaryKeyAliases: string[],
+        chunkSize: number,
+    ): AsyncIterableIterator<Entity> {
+        this.expressionMap.queryEntity = true
+        const [sql, parameters] = this.getQueryAndParameters()
+        const queryRunner = this.obtainQueryRunner()
+        let transactionStartedByUs: boolean = false
+
+        try {
+            if (
+                this.expressionMap.useTransaction === true &&
+                queryRunner.isTransactionActive === false
+            ) {
+                await queryRunner.startTransaction()
+                transactionStartedByUs = true
+            }
+
+            const releaseFn = () => {
+                if (queryRunner !== this.queryRunner)
+                    // means we created our own query runner
+                    return queryRunner.release()
+                return
+            }
+            const rawStream = queryRunner.stream(
+                sql,
+                parameters,
+                releaseFn,
+                releaseFn,
+            )
+
+            const relationIdLoader = new RelationIdLoader(
+                this.dataSource,
+                queryRunner,
+                this.expressionMap.relationIdAttributes,
+                this.expressionMap.withDeleted,
+            )
+
+            let buffer: any[] = []
+            let bufferedRootId: string | undefined
+
+            for await (const rawResult of rawStream as AsyncIterable<any>) {
+                const rootId = primaryKeyAliases
+                    .map((alias) => String(rawResult[alias]))
+                    .join("|")
+
+                // only close a chunk on a root boundary, so every group inside
+                // it is complete
+                if (
+                    buffer.length >= chunkSize &&
+                    bufferedRootId !== undefined &&
+                    rootId !== bufferedRootId
+                ) {
+                    yield* await this.hydrateStreamedChunk(
+                        buffer,
+                        relationIdLoader,
+                        queryRunner,
+                    )
+                    buffer = []
+                }
+
+                bufferedRootId = rootId
+                buffer.push(rawResult)
+            }
+
+            if (buffer.length > 0) {
+                yield* await this.hydrateStreamedChunk(
+                    buffer,
+                    relationIdLoader,
+                    queryRunner,
+                )
+            }
+
+            if (transactionStartedByUs) {
+                await queryRunner.commitTransaction()
+            }
+        } catch (error) {
+            if (transactionStartedByUs) {
+                try {
+                    await queryRunner.rollbackTransaction()
+                } catch (rollbackError) {}
+            }
+            throw error
+        }
+    }
+
+    /**
      * Enables or disables query result caching.
      */
     cache(enabled: boolean): this
@@ -3840,6 +3994,87 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         })
 
         return [selectString, orderByObject]
+    }
+
+    /**
+     * Ensures the query is ordered by the root primary key, which chunked
+     * streaming relies on to know that every row of a root entity has arrived
+     * before the chunk containing it is closed.
+     *
+     * @param metadata metadata of the root entity
+     * @param aliasName alias of the root entity
+     */
+    protected assertOrderedByPrimaryKey(
+        metadata: EntityMetadata,
+        aliasName: string,
+    ): void {
+        const expected = new Set(
+            metadata.primaryColumns.map(
+                (column) => `${aliasName}.${column.propertyPath}`,
+            ),
+        )
+        const leading = Object.keys(this.expressionMap.allOrderBys).slice(
+            0,
+            expected.size,
+        )
+
+        const orderedByPrimaryKey =
+            leading.length === expected.size &&
+            leading.every((key) => expected.has(key))
+
+        if (!orderedByPrimaryKey) {
+            const suggestion = [...expected]
+                .map((key) => `"${key}"`)
+                .join(", then ")
+            throw new TypeORMError(
+                `"streamEntities" requires the query to be ordered by the root primary key so that rows of one entity are not interleaved with another's. ` +
+                    `Add .orderBy(${suggestion}) before streaming.`,
+            )
+        }
+    }
+
+    /**
+     * Transforms one buffered chunk of raw rows into entities.
+     *
+     * The chunk must contain every row of each root entity it covers, otherwise
+     * a to-many relation would be split across two chunks and hydrated twice,
+     * each time with only part of its collection.
+     *
+     * @param rawResults buffered raw rows, closed on a root-entity boundary
+     * @param relationIdLoader loader reused across chunks
+     * @param queryRunner query runner used to broadcast load events
+     */
+    protected async hydrateStreamedChunk(
+        rawResults: any[],
+        relationIdLoader: RelationIdLoader,
+        queryRunner: QueryRunner,
+    ): Promise<Entity[]> {
+        if (rawResults.length === 0) return []
+
+        const rawRelationIdResults = await relationIdLoader.load(rawResults)
+        const transformer = new RawSqlResultsToEntityTransformer(
+            this.expressionMap,
+            this.dataSource.driver,
+            rawRelationIdResults,
+            this.queryRunner,
+        )
+        const entities = transformer.transform(
+            rawResults,
+            this.expressionMap.mainAlias!,
+        )
+
+        if (
+            this.expressionMap.callListeners === true &&
+            this.expressionMap.mainAlias!.hasMetadata
+        ) {
+            await queryRunner.broadcaster.broadcast(
+                "Load",
+                this.expressionMap.mainAlias!.metadata,
+                entities,
+            )
+        }
+
+        return entities
     }
 
     /**
