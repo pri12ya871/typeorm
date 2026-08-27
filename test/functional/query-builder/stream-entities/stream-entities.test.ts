@@ -205,6 +205,59 @@ describe("query builder > stream entities > hydration", () => {
             }),
         ))
 
+    it("keeps the query runner usable for the final chunk", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                await seed(dataSource)
+
+                // loadRelationIdAndMap makes chunk hydration issue its own
+                // query, including for the chunk closed after the driver
+                // stream has already ended
+                const streamed: Post[] = []
+                const iterator = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .loadRelationIdAndMap("post.commentIds", "post.comments")
+                    .orderBy("post.id", "ASC")
+                    .streamEntities({ chunkSize: 2 })
+
+                for await (const post of iterator) streamed.push(post)
+
+                expect(streamed).to.have.length(POSTS)
+                for (const post of streamed) {
+                    expect((post as any).commentIds).to.have.length(
+                        COMMENTS_PER_POST,
+                    )
+                }
+            }),
+        ))
+
+    it("releases the query runner when the consumer stops iterating early", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                await seed(dataSource)
+
+                // more iterations than the connection pool holds, so a runner
+                // leaked on early exit would exhaust it
+                for (let attempt = 0; attempt < 12; attempt++) {
+                    const iterator = dataSource
+                        .createQueryBuilder(Post, "post")
+                        .leftJoinAndSelect("post.comments", "comment")
+                        .orderBy("post.id", "ASC")
+                        .streamEntities({ chunkSize: 1 })
+
+                    for await (const post of iterator) {
+                        expect(post.id).to.be.a("number")
+                        break
+                    }
+                }
+
+                // the pool still has capacity for ordinary work
+                expect(await dataSource.getRepository(Post).count()).to.equal(
+                    POSTS,
+                )
+            }),
+        ))
+
     it("matches what getMany returns for the same query", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {

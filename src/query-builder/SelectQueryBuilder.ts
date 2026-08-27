@@ -2102,7 +2102,9 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         this.expressionMap.queryEntity = true
         const [sql, parameters] = this.getQueryAndParameters()
         const queryRunner = this.obtainQueryRunner()
+        const releaseQueryRunner = queryRunner !== this.queryRunner
         let transactionStartedByUs: boolean = false
+        let rawStream: ReadStream | undefined
 
         try {
             if (
@@ -2113,18 +2115,12 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                 transactionStartedByUs = true
             }
 
-            const releaseFn = () => {
-                if (queryRunner !== this.queryRunner)
-                    // means we created our own query runner
-                    return queryRunner.release()
-                return
-            }
-            const rawStream = await queryRunner.stream(
-                sql,
-                parameters,
-                releaseFn,
-                releaseFn,
-            )
+            // deliberately no onEnd/onError release callbacks: the last chunk
+            // is hydrated after the stream has already ended, and that
+            // hydration still needs the query runner. Cleanup happens in
+            // "finally" instead, which also covers a consumer that stops
+            // iterating early.
+            rawStream = await queryRunner.stream(sql, parameters)
 
             const relationIdLoader = new RelationIdLoader(
                 this.dataSource,
@@ -2136,10 +2132,13 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
             let buffer: any[] = []
             let bufferedRootId: string | undefined
 
-            for await (const rawResult of rawStream as AsyncIterable<any>) {
-                const rootId = primaryKeyAliases
-                    .map((alias) => String(rawResult[alias]))
-                    .join("|")
+            for await (const rawResult of rawStream) {
+                // serialised rather than joined on a separator, so that a key
+                // value containing the separator cannot collide with the next
+                // entity and merge two roots into one chunk boundary
+                const rootId = JSON.stringify(
+                    primaryKeyAliases.map((alias) => rawResult[alias]),
+                )
 
                 // only close a chunk on a root boundary, so every group inside
                 // it is complete
@@ -2178,6 +2177,17 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                 } catch (rollbackError) {}
             }
             throw error
+        } finally {
+            // a consumer that breaks out of the iteration closes this generator
+            // without the stream having ended, so the driver stream stays open
+            // and a transaction we started stays unresolved
+            rawStream?.destroy()
+            if (transactionStartedByUs && queryRunner.isTransactionActive) {
+                try {
+                    await queryRunner.rollbackTransaction()
+                } catch (rollbackError) {}
+            }
+            if (releaseQueryRunner) await queryRunner.release()
         }
     }
 
