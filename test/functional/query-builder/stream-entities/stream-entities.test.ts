@@ -93,6 +93,87 @@ describe("query builder > stream entities", () => {
             }),
         ))
 
+    it("throws when relation ids are loaded", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .loadRelationIdAndMap("post.commentIds", "post.comments")
+                    .orderBy("post.id", "ASC")
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /does not support relation id loading/,
+                )
+            }),
+        ))
+
+    it('throws when "take" is combined with a join', () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .leftJoinAndSelect("post.comments", "comment")
+                    .orderBy("post.id", "ASC")
+                    .take(2)
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /together with joins/,
+                )
+            }),
+        ))
+
+    it('allows "take" when there is no join to inflate the row count', () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .orderBy("post.id", "ASC")
+                    .take(2)
+
+                expect(() => qb.streamEntities()).to.not.throw()
+            }),
+        ))
+
+    it("throws on an optimistic lock", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .orderBy("post.id", "ASC")
+                    .setLock("optimistic", 1)
+
+                expect(() => qb.streamEntities()).to.throw()
+            }),
+        ))
+
+    it("throws on a pessimistic lock outside a transaction", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .orderBy("post.id", "ASC")
+                    .setLock("pessimistic_write")
+
+                expect(() => qb.streamEntities()).to.throw()
+            }),
+        ))
+
+    it("throws on a fractional or non finite chunk size", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const build = () =>
+                    dataSource
+                        .createQueryBuilder(Post, "post")
+                        .orderBy("post.id", "ASC")
+
+                for (const chunkSize of [1.5, NaN, Infinity]) {
+                    expect(() =>
+                        build().streamEntities({ chunkSize }),
+                    ).to.throw(/positive integer/)
+                }
+            }),
+        ))
+
     it("throws when selecting something without entity metadata", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {
@@ -117,7 +198,7 @@ describe("query builder > stream entities", () => {
                     .orderBy("post.id", "ASC")
 
                 expect(() => qb.streamEntities({ chunkSize: 0 })).to.throw(
-                    /"chunkSize" must be a positive number/,
+                    /"chunkSize" must be a positive integer/,
                 )
             }),
         ))
@@ -201,32 +282,6 @@ describe("query builder > stream entities > hydration", () => {
                 for (const post of streamed) {
                     expect(post.comments).to.have.length(COMMENTS_PER_POST)
                     expect(post.title).to.be.a("string")
-                }
-            }),
-        ))
-
-    it("keeps the query runner usable for the final chunk", () =>
-        Promise.all(
-            dataSources.map(async (dataSource) => {
-                await seed(dataSource)
-
-                // loadRelationIdAndMap makes chunk hydration issue its own
-                // query, including for the chunk closed after the driver
-                // stream has already ended
-                const streamed: Post[] = []
-                const iterator = dataSource
-                    .createQueryBuilder(Post, "post")
-                    .loadRelationIdAndMap("post.commentIds", "post.comments")
-                    .orderBy("post.id", "ASC")
-                    .streamEntities({ chunkSize: 2 })
-
-                for await (const post of iterator) streamed.push(post)
-
-                expect(streamed).to.have.length(POSTS)
-                for (const post of streamed) {
-                    expect((post as any).commentIds).to.have.length(
-                        COMMENTS_PER_POST,
-                    )
                 }
             }),
         ))

@@ -2027,8 +2027,10 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
      * another's and the grouping would be wrong. That ordering is not applied
      * implicitly — it has to be requested, so the query plan stays the caller's.
      *
-     * The "query" relation load strategy is not supported: it loads relations in
-     * a second pass over the complete result set, which streaming never has.
+     * Some query shapes are rejected rather than silently mishandled, because
+     * they need a pass over the complete result set that streaming never has:
+     * the "query" relation load strategy, relation id loading, "skip"/"take"
+     * combined with joins, and locking.
      *
      * Note that "afterLoad" subscribers are broadcast per chunk rather than once
      * for the whole result set, which is an intentional difference from
@@ -2066,6 +2068,39 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                 `"streamEntities" does not support the "query" relation load strategy, because those relations are loaded in a second pass over the complete result set, which streaming never materialises. Use the "join" strategy, or "stream" for raw rows.`,
             )
 
+        if (this.expressionMap.lockMode === "optimistic")
+            throw new OptimisticLockCanNotBeUsedError()
+
+        if (
+            (this.expressionMap.lockMode === "pessimistic_read" ||
+                this.expressionMap.lockMode === "pessimistic_write" ||
+                this.expressionMap.lockMode === "for_no_key_update" ||
+                this.expressionMap.lockMode === "for_key_share") &&
+            !this.queryRunner?.isTransactionActive
+        )
+            throw new PessimisticLockTransactionRequiredError()
+
+        // loading relation ids issues its own query, and at an intermediate
+        // chunk boundary that query would run on the connection whose raw
+        // stream is still open — a second command on one client deadlocks on
+        // postgres and cockroach
+        if (this.expressionMap.relationIdAttributes.length > 0)
+            throw new TypeORMError(
+                `"streamEntities" does not support relation id loading, because loading them issues a second query on the connection that is still streaming. Load the relations with a join instead.`,
+            )
+
+        // entity-level pagination rewrites the query into a distinct-root
+        // subquery, which streaming skips; a row-level LIMIT would cut a
+        // to-many collection in half and yield fewer entities than asked for
+        if (
+            (this.expressionMap.skip !== undefined ||
+                this.expressionMap.take !== undefined) &&
+            this.expressionMap.joinAttributes.length > 0
+        )
+            throw new TypeORMError(
+                `"streamEntities" does not support "skip"/"take" together with joins, because the limit would apply to joined rows rather than to entities.`,
+            )
+
         const primaryKeyAliases = metadata.primaryColumns.map((column) =>
             DriverUtils.buildAlias(
                 this.dataSource.driver,
@@ -2078,8 +2113,10 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         this.assertOrderedByPrimaryKey(metadata, mainAlias.name)
 
         const chunkSize = options?.chunkSize ?? 1000
-        if (chunkSize < 1)
-            throw new TypeORMError(`"chunkSize" must be a positive number.`)
+        // NaN and Infinity both slip past a "< 1" test and make the boundary
+        // threshold unreachable, buffering the whole result set
+        if (!Number.isInteger(chunkSize) || chunkSize < 1)
+            throw new TypeORMError(`"chunkSize" must be a positive integer.`)
 
         return this.streamEntitiesInternal(primaryKeyAliases, chunkSize)
     }
@@ -4029,23 +4066,36 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         metadata: EntityMetadata,
         aliasName: string,
     ): void {
-        const expected = new Set(
-            metadata.primaryColumns.map(
-                (column) => `${aliasName}.${column.propertyPath}`,
-            ),
-        )
+        // order-by criteria resolve by property path or by database name, and
+        // a naming strategy can make those differ, so accept either form
+        const byCriteria = new Map<string, string>()
+        for (const column of metadata.primaryColumns) {
+            byCriteria.set(
+                `${aliasName}.${column.propertyPath}`,
+                column.propertyPath,
+            )
+            byCriteria.set(
+                `${aliasName}.${column.databaseName}`,
+                column.propertyPath,
+            )
+        }
+
         const leading = Object.keys(this.expressionMap.allOrderBys).slice(
             0,
-            expected.size,
+            metadata.primaryColumns.length,
+        )
+        const covered = new Set(
+            leading
+                .map((key) => byCriteria.get(key))
+                .filter((path): path is string => path !== undefined),
         )
 
         const orderedByPrimaryKey =
-            leading.length === expected.size &&
-            leading.every((key) => expected.has(key))
+            covered.size === metadata.primaryColumns.length
 
         if (!orderedByPrimaryKey) {
-            const suggestion = [...expected]
-                .map((key) => `"${key}"`)
+            const suggestion = metadata.primaryColumns
+                .map((column) => `"${aliasName}.${column.propertyPath}"`)
                 .join(", then ")
             throw new TypeORMError(
                 `"streamEntities" requires the query to be ordered by the root primary key so that rows of one entity are not interleaved with another's. ` +
