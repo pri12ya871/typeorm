@@ -2088,10 +2088,7 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
 
         if (
             this.expressionMap.callListeners === true &&
-            (metadata.afterLoadListeners.length > 0 ||
-                this.dataSource.subscribers.some(
-                    (subscriber) => !!subscriber.afterLoad,
-                ))
+            this.hasAfterLoadHandlers(metadata)
         )
             throw new TypeORMError(
                 `"streamEntities" cannot run "afterLoad" listeners or subscribers, because they are broadcast while the stream is paused between chunks and any query they make would run on the connection that is still streaming. Call ".callListeners(false)" to stream without them.`,
@@ -4103,6 +4100,40 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
      * @param metadata metadata of the root entity
      * @param aliasName alias of the root entity
      */
+    /**
+     * Whether loading this query would broadcast an "afterLoad" event to any
+     * listener or subscriber.
+     *
+     * Mirrors what the broadcaster actually does: the load event is broadcast
+     * for the root entity and recursively for each joined relation, and a
+     * subscriber only receives it when its "listenTo" covers that entity.
+     *
+     * @param metadata metadata of the root entity
+     * @returns true when at least one handler would run
+     */
+    protected hasAfterLoadHandlers(metadata: EntityMetadata): boolean {
+        const loaded: EntityMetadata[] = [metadata]
+        for (const join of this.expressionMap.joinAttributes) {
+            if (join.metadata && !loaded.includes(join.metadata))
+                loaded.push(join.metadata)
+        }
+
+        return loaded.some(
+            (loadedMetadata) =>
+                loadedMetadata.afterLoadListeners.length > 0 ||
+                this.dataSource.subscribers.some(
+                    (subscriber) =>
+                        !!subscriber.afterLoad &&
+                        (!subscriber.listenTo?.() ||
+                            subscriber.listenTo() === Object ||
+                            subscriber.listenTo() === loadedMetadata.target ||
+                            subscriber
+                                .listenTo()
+                                .isPrototypeOf(loadedMetadata.target)),
+                ),
+        )
+    }
+
     protected assertOrderedByPrimaryKey(
         metadata: EntityMetadata,
         aliasName: string,

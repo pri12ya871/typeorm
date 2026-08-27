@@ -9,13 +9,14 @@ import { Post } from "./entity/Post"
 import { Comment } from "./entity/Comment"
 import { Bookmark } from "./entity/Bookmark"
 import { Audited } from "./entity/Audited"
+import { Note } from "./entity/Note"
 
 // see https://github.com/typeorm/typeorm/issues/12714
 describe("query builder > stream entities", () => {
     let dataSources: DataSource[]
     before(async () => {
         dataSources = await createTestingConnections({
-            entities: [Post, Comment, Bookmark, Audited],
+            entities: [Post, Comment, Bookmark, Audited, Note],
             schemaCreate: true,
             dropSchema: true,
         })
@@ -215,6 +216,70 @@ describe("query builder > stream entities", () => {
             }),
         ))
 
+    it("throws when a joined entity has an afterLoad listener", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                // the root entity has no listener; the joined one does, and the
+                // load event is broadcast for joined entities too
+                const qb = dataSource
+                    .createQueryBuilder(Note, "note")
+                    .leftJoinAndSelect("note.audited", "audited")
+                    .orderBy("note.id", "ASC")
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /cannot run "afterLoad" listeners/,
+                )
+            }),
+        ))
+
+    it("is not blocked by a subscriber listening to another entity", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const subscriber = {
+                    listenTo: () => Comment,
+                    afterLoad: () => {},
+                }
+                dataSource.subscribers.push(subscriber)
+                try {
+                    const qb = dataSource
+                        .createQueryBuilder(Post, "post")
+                        .orderBy("post.id", "ASC")
+
+                    expect(() => qb.streamEntities()).to.not.throw()
+                } finally {
+                    dataSource.subscribers.splice(
+                        dataSource.subscribers.indexOf(subscriber),
+                        1,
+                    )
+                }
+            }),
+        ))
+
+    it("is blocked by a subscriber that listens to the streamed entity", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const subscriber = {
+                    listenTo: () => Post,
+                    afterLoad: () => {},
+                }
+                dataSource.subscribers.push(subscriber)
+                try {
+                    const qb = dataSource
+                        .createQueryBuilder(Post, "post")
+                        .orderBy("post.id", "ASC")
+
+                    expect(() => qb.streamEntities()).to.throw(
+                        /cannot run "afterLoad" listeners/,
+                    )
+                } finally {
+                    dataSource.subscribers.splice(
+                        dataSource.subscribers.indexOf(subscriber),
+                        1,
+                    )
+                }
+            }),
+        ))
+
     it("allows a pessimistic lock when the stream starts its own transaction", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {
@@ -310,7 +375,7 @@ describe("query builder > stream entities > hydration", () => {
     let dataSources: DataSource[]
     before(async () => {
         dataSources = await createTestingConnections({
-            entities: [Post, Comment, Bookmark, Audited],
+            entities: [Post, Comment, Bookmark, Audited, Note],
             enabledDrivers: ["postgres", "mysql", "mariadb"],
             schemaCreate: true,
             dropSchema: true,
