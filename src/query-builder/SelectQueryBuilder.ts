@@ -2086,6 +2086,17 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                 `"streamEntities" does not support the "query" relation load strategy, because those relations are loaded in a second pass over the complete result set, which streaming never materialises. Use the "join" strategy, or "stream" for raw rows.`,
             )
 
+        if (
+            this.expressionMap.callListeners === true &&
+            (metadata.afterLoadListeners.length > 0 ||
+                this.dataSource.subscribers.some(
+                    (subscriber) => !!subscriber.afterLoad,
+                ))
+        )
+            throw new TypeORMError(
+                `"streamEntities" cannot run "afterLoad" listeners or subscribers, because they are broadcast while the stream is paused between chunks and any query they make would run on the connection that is still streaming. Call ".callListeners(false)" to stream without them.`,
+            )
+
         if (this.expressionMap.lockMode === "optimistic")
             throw new OptimisticLockCanNotBeUsedError()
 

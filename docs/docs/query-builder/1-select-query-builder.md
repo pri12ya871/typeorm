@@ -909,7 +909,13 @@ needs a pass over the complete result set that streaming never has:
   decorator
 - `skip`/`take` combined with a join, where the limit would apply to joined
   rows rather than to entities
-- optimistic and pessimistic locks
+- optimistic locks, and `afterLoad` listeners or subscribers, which would be
+  broadcast while the stream is paused — call `.callListeners(false)` to
+  stream without them
+
+A pessimistic lock is allowed, but only inside a transaction: either one that
+is already active on the query runner, or one this stream starts itself with
+`.useTransaction(true)`.
 
 ## Using pagination
 

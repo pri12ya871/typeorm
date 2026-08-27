@@ -8,13 +8,14 @@ import { expect } from "chai"
 import { Post } from "./entity/Post"
 import { Comment } from "./entity/Comment"
 import { Bookmark } from "./entity/Bookmark"
+import { Audited } from "./entity/Audited"
 
 // see https://github.com/typeorm/typeorm/issues/12714
 describe("query builder > stream entities", () => {
     let dataSources: DataSource[]
     before(async () => {
         dataSources = await createTestingConnections({
-            entities: [Post, Comment, Bookmark],
+            entities: [Post, Comment, Bookmark, Audited],
             schemaCreate: true,
             dropSchema: true,
         })
@@ -189,6 +190,31 @@ describe("query builder > stream entities", () => {
             }),
         ))
 
+    it("throws when the entity has an afterLoad listener", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Audited, "audited")
+                    .orderBy("audited.id", "ASC")
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /cannot run "afterLoad" listeners/,
+                )
+            }),
+        ))
+
+    it("allows an afterLoad entity once listeners are disabled", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Audited, "audited")
+                    .orderBy("audited.id", "ASC")
+                    .callListeners(false)
+
+                expect(() => qb.streamEntities()).to.not.throw()
+            }),
+        ))
+
     it("allows a pessimistic lock when the stream starts its own transaction", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {
@@ -284,7 +310,7 @@ describe("query builder > stream entities > hydration", () => {
     let dataSources: DataSource[]
     before(async () => {
         dataSources = await createTestingConnections({
-            entities: [Post, Comment, Bookmark],
+            entities: [Post, Comment, Bookmark, Audited],
             enabledDrivers: ["postgres", "mysql", "mariadb"],
             schemaCreate: true,
             dropSchema: true,
