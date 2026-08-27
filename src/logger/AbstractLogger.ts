@@ -10,6 +10,13 @@ import type { LoggerOptions } from "./LoggerOptions"
 import { PlatformTools } from "../platform/PlatformTools"
 import type { ObjectLiteral } from "../common/ObjectLiteral"
 
+/**
+ * Byte length beyond which a binary parameter is logged as a summary rather
+ * than serialised. Anything under this is small enough that the serialised
+ * form is still readable in a log line.
+ */
+const MAX_LOGGED_PARAMETER_BYTES = 1024
+
 export abstract class AbstractLogger implements Logger {
     // -------------------------------------------------------------------------
     // Constructor
@@ -386,10 +393,39 @@ export abstract class AbstractLogger implements Logger {
      */
     protected stringifyParams(parameters: any[] | ObjectLiteral) {
         try {
-            return JSON.stringify(parameters)
+            if (!Array.isArray(parameters)) return JSON.stringify(parameters)
+
+            return `[${parameters
+                .map((value) => this.stringifyParam(value))
+                .join(",")}]`
         } catch (error) {
             // most probably circular objects in parameters
             return parameters
         }
+    }
+
+    /**
+     * Converts a single query parameter to its logged form.
+     *
+     * A binary parameter is summarised rather than serialised: a buffer of any
+     * size becomes an array of that many numbers under `JSON.stringify`, so a
+     * large one produces a log line several times the size of the data itself,
+     * which is enough to exhaust memory before anything is written.
+     *
+     * @param value one query parameter
+     * @returns the parameter as it should appear in the log
+     */
+    protected stringifyParam(value: unknown): string {
+        if (
+            ArrayBuffer.isView(value) &&
+            value.byteLength > MAX_LOGGED_PARAMETER_BYTES
+        )
+            return `"<${value.constructor.name}(${value.byteLength} bytes)>"`
+
+        const json = JSON.stringify(value)
+
+        // JSON.stringify returns undefined for values it cannot represent,
+        // which JSON.stringify of the whole array would have rendered as null
+        return json ?? "null"
     }
 }
