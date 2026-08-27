@@ -7,12 +7,14 @@ import type { DataSource } from "../../../../src/data-source/DataSource"
 import { expect } from "chai"
 import { Post } from "./entity/Post"
 import { Comment } from "./entity/Comment"
+import { Bookmark } from "./entity/Bookmark"
 
+// see https://github.com/typeorm/typeorm/issues/12714
 describe("query builder > stream entities", () => {
     let dataSources: DataSource[]
     before(async () => {
         dataSources = await createTestingConnections({
-            entities: [Post, Comment],
+            entities: [Post, Comment, Bookmark],
             schemaCreate: true,
             dropSchema: true,
         })
@@ -174,6 +176,57 @@ describe("query builder > stream entities", () => {
             }),
         ))
 
+    it("throws when the entity carries a @RelationId decorator", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Bookmark, "bookmark")
+                    .orderBy("bookmark.id", "ASC")
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /does not support relation id loading/,
+                )
+            }),
+        ))
+
+    it("allows a pessimistic lock when the stream starts its own transaction", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .orderBy("post.id", "ASC")
+                    .useTransaction(true)
+                    .setLock("pessimistic_write")
+
+                expect(() => qb.streamEntities()).to.not.throw()
+            }),
+        ))
+
+    it("revalidates when the builder is mutated after the call", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .orderBy("post.id", "ASC")
+
+                // valid at the call, invalid by the time iteration starts
+                const iterator = qb.streamEntities()
+                qb.orderBy("post.title", "ASC")
+
+                let caught: unknown
+                try {
+                    for await (const _ of iterator) break
+                } catch (error) {
+                    caught = error
+                }
+
+                expect(caught)
+                    .to.be.instanceOf(Error)
+                    .and.have.property("message")
+                    .that.matches(/ordered by the root primary key/)
+            }),
+        ))
+
     it("throws when selecting something without entity metadata", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {
@@ -231,7 +284,7 @@ describe("query builder > stream entities > hydration", () => {
     let dataSources: DataSource[]
     before(async () => {
         dataSources = await createTestingConnections({
-            entities: [Post, Comment],
+            entities: [Post, Comment, Bookmark],
             enabledDrivers: ["postgres", "mysql", "mariadb"],
             schemaCreate: true,
             dropSchema: true,

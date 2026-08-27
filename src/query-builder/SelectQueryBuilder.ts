@@ -2043,6 +2043,24 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
     streamEntities(options?: {
         chunkSize?: number
     }): AsyncIterableIterator<Entity> {
+        // validated here so that misuse throws at the call site, and again when
+        // iteration starts, since the builder can be mutated in between
+        this.assertStreamable(options)
+        return this.streamEntitiesInternal(options)
+    }
+
+    /**
+     * Validates that this query can be streamed as entities, and resolves the
+     * values streaming needs.
+     *
+     * @param options same options object passed to `streamEntities`
+     * @param options.chunkSize
+     * @returns the root primary key aliases and the resolved chunk size
+     */
+    protected assertStreamable(options?: { chunkSize?: number }): {
+        primaryKeyAliases: string[]
+        chunkSize: number
+    } {
         if (!this.expressionMap.mainAlias)
             throw new TypeORMError(
                 `Alias is not set. Use "from" method to set an alias.`,
@@ -2076,7 +2094,8 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                 this.expressionMap.lockMode === "pessimistic_write" ||
                 this.expressionMap.lockMode === "for_no_key_update" ||
                 this.expressionMap.lockMode === "for_key_share") &&
-            !this.queryRunner?.isTransactionActive
+            !this.queryRunner?.isTransactionActive &&
+            this.expressionMap.useTransaction !== true
         )
             throw new PessimisticLockTransactionRequiredError()
 
@@ -2084,9 +2103,12 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         // chunk boundary that query would run on the connection whose raw
         // stream is still open — a second command on one client deadlocks on
         // postgres and cockroach
-        if (this.expressionMap.relationIdAttributes.length > 0)
+        if (
+            this.expressionMap.relationIdAttributes.length > 0 ||
+            metadata.relationIds.length > 0
+        )
             throw new TypeORMError(
-                `"streamEntities" does not support relation id loading, because loading them issues a second query on the connection that is still streaming. Load the relations with a join instead.`,
+                `"streamEntities" does not support relation id loading, whether from a @RelationId decorator or loadRelationIdAndMap, because loading those ids issues a second query on the connection that is still streaming. Load the relation with a join instead.`,
             )
 
         // entity-level pagination rewrites the query into a distinct-root
@@ -2118,7 +2140,7 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         if (!Number.isInteger(chunkSize) || chunkSize < 1)
             throw new TypeORMError(`"chunkSize" must be a positive integer.`)
 
-        return this.streamEntitiesInternal(primaryKeyAliases, chunkSize)
+        return { primaryKeyAliases, chunkSize }
     }
 
     /**
@@ -2129,13 +2151,16 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
      * does not run until something pulls from it, which would otherwise defer
      * every validation error above.
      *
-     * @param primaryKeyAliases column aliases of the root primary key
-     * @param chunkSize minimum rows to buffer before closing a chunk
+     * @param options same options object passed to `streamEntities`
+     * @param options.chunkSize
      */
-    protected async *streamEntitiesInternal(
-        primaryKeyAliases: string[],
-        chunkSize: number,
-    ): AsyncIterableIterator<Entity> {
+    protected async *streamEntitiesInternal(options?: {
+        chunkSize?: number
+    }): AsyncIterableIterator<Entity> {
+        // re-validated here because the builder may have been mutated between
+        // the call to "streamEntities" and the first pull from this generator
+        const { primaryKeyAliases, chunkSize } = this.assertStreamable(options)
+
         this.expressionMap.queryEntity = true
         const [sql, parameters] = this.getQueryAndParameters()
         const queryRunner = this.obtainQueryRunner()
@@ -2173,9 +2198,14 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                 // serialised rather than joined on a separator, so that a key
                 // value containing the separator cannot collide with the next
                 // entity and merge two roots into one chunk boundary
-                const rootId = JSON.stringify(
-                    primaryKeyAliases.map((alias) => rawResult[alias]),
+                const keyValues = primaryKeyAliases.map(
+                    (alias) => rawResult[alias],
                 )
+                if (keyValues.some((value) => value === undefined))
+                    throw new TypeORMError(
+                        `"streamEntities" could not find the root primary key in a streamed row, so entity boundaries cannot be detected. Select the primary key under its default alias.`,
+                    )
+                const rootId = JSON.stringify(keyValues)
 
                 // only close a chunk on a root boundary, so every group inside
                 // it is complete
