@@ -58,6 +58,26 @@ describe("AbstractLogger > stringifyParams", () => {
         expect(logger.stringify([undefined])).to.equal("[null]")
     })
 
+    it("renders a hole in a sparse array as null", () => {
+        // a hole at index 0, built without a sparse-array literal
+        const sparse: any[] = new Array(2)
+        sparse[1] = 1
+
+        expect(logger.stringify(sparse)).to.equal("[null,1]")
+    })
+
+    it("still passes the element index to a custom toJSON", () => {
+        class Keyed {
+            toJSON(key: string) {
+                return `key=${key}`
+            }
+        }
+
+        expect(logger.stringify([new Keyed(), new Keyed()])).to.equal(
+            '["key=0","key=1"]',
+        )
+    })
+
     it("falls back to the raw parameters when they cannot be serialised", () => {
         const circular: any = { a: 1 }
         circular.self = circular

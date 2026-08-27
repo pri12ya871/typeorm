@@ -395,9 +395,13 @@ export abstract class AbstractLogger implements Logger {
         try {
             if (!Array.isArray(parameters)) return JSON.stringify(parameters)
 
-            return `[${parameters
-                .map((value) => this.stringifyParam(value))
-                .join(",")}]`
+            // substituting before serialising keeps the array a single
+            // JSON.stringify call, so everything that is not binary is rendered
+            // exactly as it was: holes still become null, an element's index
+            // still reaches its toJSON, and the separators are unchanged
+            return JSON.stringify(
+                Array.from(parameters, (value) => this.summariseParam(value)),
+            )
         } catch (error) {
             // most probably circular objects in parameters
             return parameters
@@ -405,7 +409,7 @@ export abstract class AbstractLogger implements Logger {
     }
 
     /**
-     * Converts a single query parameter to its logged form.
+     * Replaces a query parameter that is too large to log with a summary.
      *
      * A binary parameter is summarised rather than serialised: a buffer of any
      * size becomes an array of that many numbers under `JSON.stringify`, so a
@@ -413,19 +417,15 @@ export abstract class AbstractLogger implements Logger {
      * which is enough to exhaust memory before anything is written.
      *
      * @param value one query parameter
-     * @returns the parameter as it should appear in the log
+     * @returns the parameter, or a short stand-in when it is large and binary
      */
-    protected stringifyParam(value: unknown): string {
+    protected summariseParam(value: unknown): unknown {
         if (
             ArrayBuffer.isView(value) &&
             value.byteLength > MAX_LOGGED_PARAMETER_BYTES
         )
-            return `"<${value.constructor.name}(${value.byteLength} bytes)>"`
+            return `<${value.constructor.name}(${value.byteLength} bytes)>`
 
-        const json = JSON.stringify(value)
-
-        // JSON.stringify returns undefined for values it cannot represent,
-        // which JSON.stringify of the whole array would have rendered as null
-        return json ?? "null"
+        return value
     }
 }
