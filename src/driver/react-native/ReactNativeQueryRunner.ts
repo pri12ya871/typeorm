@@ -68,92 +68,106 @@ export class ReactNativeQueryRunner extends AbstractSqliteQueryRunner {
 
         const queryStartTime = Date.now()
 
-        return new Promise(async (ok, fail) => {
+        return new Promise((ok, fail) => {
             try {
                 databaseConnection.executeSql(
                     query,
                     parameters,
                     async (raw: any) => {
-                        // log slow queries if maxQueryExecution time is set
-                        const maxQueryExecutionTime =
-                            this.driver.options.maxQueryExecutionTime
-                        const queryEndTime = Date.now()
-                        const queryExecutionTime = queryEndTime - queryStartTime
-                        this.broadcaster.broadcastAfterQueryEvent(
-                            broadcasterResult,
-                            query,
-                            parameters,
-                            true,
-                            queryExecutionTime,
-                            raw,
-                            undefined,
-                        )
-
-                        if (
-                            maxQueryExecutionTime &&
-                            queryExecutionTime > maxQueryExecutionTime
-                        )
-                            this.driver.dataSource.logger.logQuerySlow(
+                        try {
+                            // log slow queries if maxQueryExecution time is set
+                            const maxQueryExecutionTime =
+                                this.driver.options.maxQueryExecutionTime
+                            const queryEndTime = Date.now()
+                            const queryExecutionTime =
+                                queryEndTime - queryStartTime
+                            this.broadcaster.broadcastAfterQueryEvent(
+                                broadcasterResult,
+                                query,
+                                parameters,
+                                true,
                                 queryExecutionTime,
+                                raw,
+                                undefined,
+                            )
+
+                            if (
+                                maxQueryExecutionTime &&
+                                queryExecutionTime > maxQueryExecutionTime
+                            )
+                                this.driver.dataSource.logger.logQuerySlow(
+                                    queryExecutionTime,
+                                    query,
+                                    parameters,
+                                    this,
+                                )
+
+                            const result = new QueryResult()
+
+                            if (raw?.hasOwnProperty("rowsAffected")) {
+                                result.affected = raw.rowsAffected
+                            }
+
+                            if (raw?.hasOwnProperty("rows")) {
+                                const records = []
+                                for (let i = 0; i < raw.rows.length; i++) {
+                                    records.push(raw.rows.item(i))
+                                }
+
+                                result.raw = records
+                                result.records = records
+                            }
+
+                            // return id of inserted row, if query was insert statement.
+                            if (query.startsWith("INSERT INTO")) {
+                                result.raw = raw.insertId
+                            }
+
+                            // the subscribers have to finish before the caller
+                            // is resumed, otherwise it observes the query as
+                            // complete while they are still running
+                            await broadcasterResult.wait()
+
+                            if (useStructuredResult) {
+                                ok(result)
+                            } else {
+                                ok(result.raw)
+                            }
+                        } catch (err) {
+                            // a subscriber that rejects would otherwise leave this
+                            // promise unsettled forever, since neither "ok" nor
+                            // "fail" is reached
+                            fail(err)
+                        }
+                    },
+                    async (err: any) => {
+                        try {
+                            this.driver.dataSource.logger.logQueryError(
+                                err,
                                 query,
                                 parameters,
                                 this,
                             )
+                            this.broadcaster.broadcastAfterQueryEvent(
+                                broadcasterResult,
+                                query,
+                                parameters,
+                                false,
+                                undefined,
+                                undefined,
+                                err,
+                            )
 
-                        if (broadcasterResult.promises.length > 0)
-                            await Promise.all(broadcasterResult.promises)
+                            await broadcasterResult.wait()
 
-                        const result = new QueryResult()
-
-                        if (raw?.hasOwnProperty("rowsAffected")) {
-                            result.affected = raw.rowsAffected
+                            fail(new QueryFailedError(query, parameters, err))
+                        } catch (subscriberError) {
+                            fail(subscriberError)
                         }
-
-                        if (raw?.hasOwnProperty("rows")) {
-                            const records = []
-                            for (let i = 0; i < raw.rows.length; i++) {
-                                records.push(raw.rows.item(i))
-                            }
-
-                            result.raw = records
-                            result.records = records
-                        }
-
-                        // return id of inserted row, if query was insert statement.
-                        if (query.startsWith("INSERT INTO")) {
-                            result.raw = raw.insertId
-                        }
-
-                        if (useStructuredResult) {
-                            ok(result)
-                        } else {
-                            ok(result.raw)
-                        }
-                    },
-                    (err: any) => {
-                        this.driver.dataSource.logger.logQueryError(
-                            err,
-                            query,
-                            parameters,
-                            this,
-                        )
-                        this.broadcaster.broadcastAfterQueryEvent(
-                            broadcasterResult,
-                            query,
-                            parameters,
-                            false,
-                            undefined,
-                            undefined,
-                            err,
-                        )
-
-                        fail(new QueryFailedError(query, parameters, err))
                     },
                 )
             } catch (err) {
                 fail(err)
-            } finally {
-                await broadcasterResult.wait()
             }
         })
     }
