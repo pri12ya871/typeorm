@@ -65,6 +65,34 @@ describe("query builder > stream entities", () => {
             }),
         ))
 
+    it('throws when the "query" relation load strategy is used', () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .setFindOptions({ relationLoadStrategy: "query" })
+                    .orderBy("post.id", "ASC")
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /does not support the "query" relation load strategy/,
+                )
+            }),
+        ))
+
+    it('throws when the data source defaults to the "query" strategy', () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qb = dataSource
+                    .createQueryBuilder(Post, "post")
+                    .orderBy("post.id", "ASC")
+                qb.expressionMap.relationLoadStrategy = "query"
+
+                expect(() => qb.streamEntities()).to.throw(
+                    /does not support the "query" relation load strategy/,
+                )
+            }),
+        ))
+
     it("throws when selecting something without entity metadata", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {

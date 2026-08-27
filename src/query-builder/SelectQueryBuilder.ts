@@ -2027,6 +2027,9 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
      * another's and the grouping would be wrong. That ordering is not applied
      * implicitly — it has to be requested, so the query plan stays the caller's.
      *
+     * The "query" relation load strategy is not supported: it loads relations in
+     * a second pass over the complete result set, which streaming never has.
+     *
      * Note that "afterLoad" subscribers are broadcast per chunk rather than once
      * for the whole result set, which is an intentional difference from
      * `getMany()`.
@@ -2053,6 +2056,14 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
         if (metadata.primaryColumns.length === 0)
             throw new TypeORMError(
                 `"streamEntities" requires ${metadata.name} to have a primary column, because rows are grouped into entities by primary key.`,
+            )
+
+        const relationLoadStrategy =
+            this.findOptions.relationLoadStrategy ??
+            this.expressionMap.relationLoadStrategy
+        if (relationLoadStrategy === "query")
+            throw new TypeORMError(
+                `"streamEntities" does not support the "query" relation load strategy, because those relations are loaded in a second pass over the complete result set, which streaming never materialises. Use the "join" strategy, or "stream" for raw rows.`,
             )
 
         const primaryKeyAliases = metadata.primaryColumns.map((column) =>
