@@ -2108,7 +2108,7 @@ export class SelectQueryBuilder<Entity extends ObjectLiteral>
                     return queryRunner.release()
                 return
             }
-            const rawStream = queryRunner.stream(
+            const rawStream = await queryRunner.stream(
                 sql,
                 parameters,
                 releaseFn,
